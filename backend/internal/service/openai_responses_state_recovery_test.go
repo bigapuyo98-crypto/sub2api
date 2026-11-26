@@ -20,6 +20,7 @@ import (
 const crossResourceStateError = `{"error":{"code":null,"type":"invalid_request_error","message":"The requested item was created under a different Azure OpenAI resource. Use the same resource that created the item to access it."}}`
 const maskedResourceStateError = `{"error":{"code":null,"type":"invalid_request_error","param":"","message":"OpenAI Responses bad request: The requested item was created under a different *** OpenAI resource. Use the same resource that created the item to access it. [trace_id=1570ba9a03970045783f90d21e7ef16f]"}}`
 const encryptedReplayStateError = `{"error":{"code":null,"type":"invalid_request_error","message":"The encrypted content gAAA_fixture could not be verified. Reason: Encrypted content could not be decrypted or parsed."}}`
+const missingReasoningPairError = `{"error":{"code":null,"type":"invalid_request_error","message":"AR GPT: Item 'msg_history' of type 'message' was provided without its required 'reasoning' item: 'rs_history'. [trace_id=fixture]"}}`
 const stateRecoveryInput = `{"model":"gpt-5","stream":false,"store":true,"input":[{"type":"reasoning","id":"rs_history","encrypted_content":"fixture-cipher","summary":[{"type":"summary_text","text":"keep reasoning summary"}]},{"type":"message","id":"msg_history","role":"assistant","content":[{"type":"output_text","text":"keep answer","nonce":9007199254740993}]},{"type":"function_call","id":"fc_history","call_id":"call_shared","name":"lookup","arguments":"{\"n\":9007199254740993}"},{"type":"function_call_output","call_id":"call_shared","output":"keep tool result"},{"role":"user","content":"next question"}],"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}]}`
 
 func stateRecoveryResponse(status int, body string) *http.Response {
@@ -85,6 +86,96 @@ func TestOpenAIGatewayService_StateRecoveryCrossResource(t *testing.T) {
 	require.Equal(t, http.StatusOK, recorder.Code)
 	require.Equal(t, "resp_recovered", gjson.Get(recorder.Body.String(), "id").String())
 	require.NotContains(t, recorder.Body.String(), "different Azure")
+}
+
+func TestOpenAIGatewayService_StateRecoveryMissingReasoningPair(t *testing.T) {
+	for _, passthrough := range []bool{false, true} {
+		for _, stream := range []bool{false, true} {
+			t.Run(fmt.Sprintf("passthrough=%v/stream=%v", passthrough, stream), func(t *testing.T) {
+				success := stateRecoverySuccess()
+				if stream {
+					success = stateRecoveryStreamSuccess()
+				}
+				svc, c, account, upstream, recorder := newStateRecoveryForward(t, passthrough,
+					stateRecoveryResponse(http.StatusBadRequest, missingReasoningPairError), success)
+				body, err := sjson.SetBytes([]byte(stateRecoveryInput), "store", false)
+				require.NoError(t, err)
+				body, err = sjson.SetBytes(body, "stream", stream)
+				require.NoError(t, err)
+				body, err = sjson.SetRawBytes(body, "input.4", []byte(`{"type":"message","id":"msg_later","role":"assistant","content":[{"type":"output_text","text":"keep later answer"}]}`))
+				require.NoError(t, err)
+				original := bytes.Clone(body)
+
+				_, err = svc.Forward(context.Background(), c, account, body)
+
+				require.NotEmpty(t, upstream.bodies)
+				first := upstream.bodies[0]
+				require.False(t, gjson.GetBytes(first, "input.0.id").Exists())
+				require.Equal(t, "fixture-cipher", gjson.GetBytes(first, "input.0.encrypted_content").String())
+				require.Equal(t, "msg_history", gjson.GetBytes(first, "input.1.id").String())
+				require.Equal(t, "msg_later", gjson.GetBytes(first, "input.4.id").String())
+				require.Equal(t, 2, len(upstream.bodies), "上游拒绝缺少配对项的历史时，应只重发一次可回放的请求")
+				require.NoError(t, err)
+				require.Equal(t, http.StatusOK, recorder.Code)
+				require.Equal(t, original, body)
+				want := first
+				for _, path := range []string{"input.1.id", "input.2.id", "input.4.id"} {
+					want, err = sjson.DeleteBytes(want, path)
+					require.NoError(t, err)
+				}
+				require.JSONEq(t, string(want), string(upstream.bodies[1]), "剥离可重放的历史项 ID，保留推理密文和工具配对")
+				require.Equal(t, "9007199254740993", gjson.GetBytes(upstream.bodies[1], "input.1.content.0.nonce").Raw)
+			})
+		}
+	}
+}
+
+func TestOpenAIGatewayService_StateRecoveryMissingReasoningPairBoundaries(t *testing.T) {
+	for _, passthrough := range []bool{false, true} {
+		for _, tc := range []struct {
+			name, path, patch, errorBody string
+			status, attempts             int
+		}{
+			{"secondPairStops", "", "", missingReasoningPairError, 400, 2},
+			{"noTargetID", "input.1.id", `"msg_other"`, missingReasoningPairError, 400, 1},
+			{"targetNotInline", "input.1.content", `null`, missingReasoningPairError, 400, 1},
+			{"previousResponse", "previous_response_id", `"resp_saved"`, missingReasoningPairError, 400, 1},
+			{"conversation", "conversation", `{"id":"conv_saved"}`, missingReasoningPairError, 400, 1},
+			{"itemReference", "input.5", `{"type":"item_reference","id":"msg_saved"}`, missingReasoningPairError, 400, 1},
+			{"normalizedReasoningReference", "input.5", `{"type":"item_reference","id":"rs_saved"}`, missingReasoningPairError, 400, 1},
+			{"compaction", "input.5", `{"type":"compaction","encrypted_content":"only-history"}`, missingReasoningPairError, 400, 1},
+			{"compactionSummary", "input.5", `{"type":"compaction_summary","summary":"only-history"}`, missingReasoningPairError, 400, 1},
+			{"ordinaryBadRequest", "", "", `{"error":{"type":"invalid_request_error","message":"Invalid parameter"}}`, 400, 1},
+			{"nearMiss", "", "", strings.Replace(missingReasoningPairError, "its required 'reasoning' item", "a required 'reasoning' item", 1), 400, 1},
+			{"upstreamFailure", "", "", missingReasoningPairError, 502, 1},
+			{"oauth", "", "", missingReasoningPairError, 400, 1},
+			{"compact", "", "", missingReasoningPairError, 400, 1},
+		} {
+			t.Run(fmt.Sprintf("%s/passthrough=%v", tc.name, passthrough), func(t *testing.T) {
+				svc, c, account, upstream, _ := newStateRecoveryForward(t, passthrough,
+					stateRecoveryResponse(tc.status, tc.errorBody),
+					stateRecoveryResponse(tc.status, tc.errorBody), stateRecoverySuccess())
+				body, err := sjson.SetBytes([]byte(stateRecoveryInput), "store", false)
+				require.NoError(t, err)
+				if tc.path != "" {
+					body, err = sjson.SetRawBytes(body, tc.path, []byte(tc.patch))
+					require.NoError(t, err)
+				}
+				switch tc.name {
+				case "oauth":
+					account.Type = AccountTypeOAuth
+					account.Credentials = map[string]any{"access_token": "fixture-only", "chatgpt_account_id": "fixture-account"}
+				case "compact":
+					c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses/compact", nil)
+				}
+
+				_, err = svc.Forward(context.Background(), c, account, body)
+
+				require.Error(t, err)
+				require.Equal(t, tc.attempts, len(upstream.requests))
+			})
+		}
+	}
 }
 
 func stateRecoveryStreamSuccess() *http.Response {

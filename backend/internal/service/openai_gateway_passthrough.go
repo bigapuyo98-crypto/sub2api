@@ -353,6 +353,7 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 	agentTaskRecoveryTried := false
 	compactModelFallbackRetried := false
 	httpStateRetryAttempts := 0
+	missingReasoningPairRetried := false
 	rejectedFieldRetryState := openAIResponsesRejectedFieldRetryStateForRequest(c, body)
 	var resp *http.Response
 	var usage *OpenAIUsage
@@ -402,6 +403,22 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 					return nil, fmt.Errorf("agent identity task recovery failed: %w", recoveryErr)
 				}
 				continue
+			}
+			if !missingReasoningPairRetried {
+				retryBody, changed, retryErr := prepareOpenAIMissingReasoningPairRetry(c, account, resp.StatusCode, probeBody, canonicalImageIntentBody, body)
+				if retryErr != nil {
+					return nil, retryErr
+				}
+				if changed {
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
+					body = retryBody
+					missingReasoningPairRetried = true
+					rejectedFieldRetryState.remember(body)
+					logger.LegacyPrintf("service.openai_gateway", "[OpenAI passthrough] Responses missing reasoning pair retry account_id=%d", account.ID)
+					continue
+				}
 			}
 			if account.IsOpenAIApiKey() && !isOpenAIResponsesCompactPath(c) &&
 				httpStateRetryAttempts < maxOpenAIResponsesStateRetries &&

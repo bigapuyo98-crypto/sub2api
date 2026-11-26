@@ -6,8 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
 	"net/http"
+	"regexp"
 	"strings"
 	"unicode/utf8"
 
@@ -16,6 +16,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/pkg/apicompat"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/ctxkey"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/httputil"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
 	"github.com/Wei-Shaw/sub2api/internal/util/urlvalidator"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -367,27 +368,76 @@ func isOpenAIResponsesStateRecoveryError(status int, responseBody []byte) bool {
 		(strings.Contains(message, "encrypted content") && strings.Contains(message, "could not be verified"))
 }
 
+var openAIMissingReasoningPair = regexp.MustCompile(`\bItem '(msg_[A-Za-z0-9_-]+)' of type 'message' was provided without its required 'reasoning' item: 'rs_[A-Za-z0-9_-]+'(?:\.|$)`)
+
+func prepareOpenAIMissingReasoningPairRetry(c *gin.Context, account *Account, status int, responseBody, originalBody, sentBody []byte) ([]byte, bool, error) {
+	if !canRetryOpenAIResponsesReasoningPair(c, account, status) {
+		return sentBody, false, nil
+	}
+	match := openAIMissingReasoningPair.FindStringSubmatch(extractUpstreamErrorMessage(responseBody))
+	if match == nil {
+		return sentBody, false, nil
+	}
+	request, items, err := decodeInlineOpenAIResponsesReplay(sentBody)
+	if err != nil {
+		return sentBody, false, err
+	}
+	if !hasInlineOpenAIResponsesMessageID(items, match[1]) {
+		return sentBody, false, nil
+	}
+	// store:false 的预处理可能已移除推理引用；重试还得确认原历史可独立回放。
+	if !bytes.Equal(originalBody, sentBody) {
+		if _, originalItems, err := decodeInlineOpenAIResponsesReplay(originalBody); err != nil || originalItems == nil {
+			return sentBody, false, err
+		}
+	}
+	// 一段历史可能有多对旧 ID。保留可用密文，只移除内联回放的持久化 ID。
+	request["input"], _ = stripInlineStateFromOpenAIResponsesItems(items, false)
+	retryBody, err := marshalOpenAIUpstreamJSON(request)
+	return retryBody, true, err
+}
+
+func canRetryOpenAIResponsesReasoningPair(c *gin.Context, account *Account, status int) bool {
+	return status == http.StatusBadRequest && account.IsOpenAIApiKey() &&
+		GetOpenAIClientTransport(c) == OpenAIClientTransportHTTP && openAIResponsesRequestPathSuffix(c) == ""
+}
+
+func hasInlineOpenAIResponsesMessageID(items []any, id string) bool {
+	for _, raw := range items {
+		item, ok := raw.(map[string]any)
+		if ok && item["type"] == "message" && item["id"] == id && isInlineOpenAIResponsesInputItem(item) {
+			return true
+		}
+	}
+	return false
+}
+
 // stripOpenAIResponsesInlineState 生成重试请求体，不修改调用方原始字节。
 // 遇到不透明历史引用或 compaction 项时保持原样，不静默删除会话历史。
 func stripOpenAIResponsesInlineState(body []byte) ([]byte, bool, error) {
-	var request map[string]any
-	if err := decodeOpenAIJSONUseNumber(body, &request); err != nil {
-		return nil, false, fmt.Errorf("decode Responses state retry: %w", err)
+	request, items, err := decodeInlineOpenAIResponsesReplay(body)
+	if err != nil || items == nil {
+		return body, false, err
 	}
-	if hasOpaqueOpenAIResponsesReference(request) {
-		return body, false, nil
-	}
-	items, ok := request["input"].([]any)
-	if !ok || hasOpaqueOpenAIResponsesInputItem(items) {
-		return body, false, nil
-	}
-	filtered, changed := stripInlineStateFromOpenAIResponsesItems(items)
+	filtered, changed := stripInlineStateFromOpenAIResponsesItems(items, true)
 	if !changed {
 		return body, false, nil
 	}
 	request["input"] = filtered
 	retryBody, err := marshalOpenAIUpstreamJSON(request)
 	return retryBody, true, err
+}
+
+func decodeInlineOpenAIResponsesReplay(body []byte) (map[string]any, []any, error) {
+	var request map[string]any
+	if err := decodeOpenAIJSONUseNumber(body, &request); err != nil {
+		return nil, nil, fmt.Errorf("decode Responses state retry: %w", err)
+	}
+	items, ok := request["input"].([]any)
+	if !ok || hasOpaqueOpenAIResponsesReference(request) || hasOpaqueOpenAIResponsesInputItem(items) {
+		return nil, nil, nil
+	}
+	return request, items, nil
 }
 
 func hasOpaqueOpenAIResponsesReference(request map[string]any) bool {
@@ -437,7 +487,7 @@ func hasInlineOpenAIResponsesToolCall(item map[string]any, payloadField string) 
 	return callID != "" && name != "" && hasPayload
 }
 
-func stripInlineStateFromOpenAIResponsesItems(items []any) ([]any, bool) {
+func stripInlineStateFromOpenAIResponsesItems(items []any, stripEncryptedContent bool) ([]any, bool) {
 	changed := false
 	filtered := make([]any, 0, len(items))
 	for _, raw := range items {
@@ -451,7 +501,7 @@ func stripInlineStateFromOpenAIResponsesItems(items []any) ([]any, bool) {
 				delete(item, "id")
 				changed = true
 			}
-			if _, exists := item["encrypted_content"]; exists {
+			if _, exists := item["encrypted_content"]; stripEncryptedContent && exists {
 				delete(item, "encrypted_content")
 				changed = true
 			}

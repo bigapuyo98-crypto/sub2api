@@ -1057,6 +1057,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 
 	// 仅在检测到显式 API-key 跨资源/密文状态失效时做有界重试，保留 OAuth/compact 的既有 1 次预算。
 	httpStateRetryAttempts := 0
+	missingReasoningPairRetried := false
 	compactModelFallbackRetried := false
 	agentTaskRecoveryTried := false
 	rejectedFieldRetryState := openAIResponsesRejectedFieldRetryStateForRequest(c, body)
@@ -1137,6 +1138,24 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			}
 			respBody = s.redactAgentIdentitySensitiveBody(ctx, account, respBody)
 			resp.Body = io.NopCloser(bytes.NewReader(respBody))
+			if !missingReasoningPairRetried {
+				retryBody, changed, retryErr := prepareOpenAIMissingReasoningPairRetry(c, account, resp.StatusCode, respBody, canonicalImageIntentBody, body)
+				if retryErr != nil {
+					return nil, retryErr
+				}
+				if changed {
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
+					body = retryBody
+					requestView = newOpenAIRequestView(body)
+					reqBody = nil
+					missingReasoningPairRetried = true
+					rejectedFieldRetryState.remember(body)
+					logger.LegacyPrintf("service.openai_gateway", "[OpenAI] Responses missing reasoning pair retry account_id=%d", account.ID)
+					continue
+				}
+			}
 			invalidEncryptedContentError := upstreamCode == "invalid_encrypted_content" ||
 				(upstreamCode == "thinking_signature_invalid" &&
 					strings.Contains(upstreamMsg, "The encrypted content") &&
