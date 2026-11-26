@@ -694,12 +694,16 @@ func TestOpenAIGatewayService_Forward_HTTPThinkingSignatureRecoveryAndLineage(t 
 	require.Equal(t, "result", gjson.GetBytes(upstream.bodies[2], "input.2.output").String())
 }
 
-func TestOpenAIGatewayService_Forward_HTTPThinkingSignatureDoesNotRetryUnrelatedErrors(t *testing.T) {
+func TestOpenAIGatewayService_Forward_HTTPThinkingSignatureRetryClassification(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	for _, tc := range []struct{ name, code, message, input string }{
-		{"no encrypted reasoning", "thinking_signature_invalid", "The encrypted content could not be verified. Reason: Encrypted content could not be decrypted or parsed.", `[{"type":"message","role":"user","content":"hello"}]`},
-		{"ordinary 400", "invalid_request_error", "bad request", `[{"type":"reasoning","encrypted_content":"stale"},{"type":"message","content":"hello"}]`},
-		{"unrelated signature error", "thinking_signature_invalid", "Invalid signature", `[{"type":"reasoning","encrypted_content":"stale"},{"type":"message","content":"hello"}]`},
+	for _, tc := range []struct {
+		name, code, message, input string
+		wantRequests               int
+	}{
+		// 目标错误在无内联加密状态可剥离时，仍保留 API Key 的 3 次重试预算。
+		{"no encrypted reasoning", "thinking_signature_invalid", "The encrypted content could not be verified. Reason: Encrypted content could not be decrypted or parsed.", `[{"type":"message","role":"user","content":"hello"}]`, 4},
+		{"ordinary 400", "invalid_request_error", "bad request", `[{"type":"reasoning","encrypted_content":"stale"},{"type":"message","content":"hello"}]`, 1},
+		{"unrelated signature error", "thinking_signature_invalid", "Invalid signature", `[{"type":"reasoning","encrypted_content":"stale"},{"type":"message","content":"hello"}]`, 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			upstream := &httpUpstreamRecorder{resp: &http.Response{StatusCode: http.StatusBadRequest, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"error":{"code":"` + tc.code + `","message":"` + tc.message + `"}}`))}}
@@ -711,7 +715,7 @@ func TestOpenAIGatewayService_Forward_HTTPThinkingSignatureDoesNotRetryUnrelated
 			c.Request = httptest.NewRequest(http.MethodPost, "/openai/v1/responses", nil)
 			SetOpenAIClientTransport(c, OpenAIClientTransportHTTP)
 			_, _ = svc.Forward(context.Background(), c, account, []byte(`{"model":"gpt-5","stream":false,"input":`+tc.input+`}`))
-			require.Len(t, upstream.bodies, 1)
+			require.Len(t, upstream.bodies, tc.wantRequests)
 		})
 	}
 }

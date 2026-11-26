@@ -346,6 +346,124 @@ func asDeepSeekResponsesSlice(value any) ([]any, bool) {
 	}
 }
 
+const maxOpenAIResponsesStateRetries = 3
+
+// 中转商对跨资源绑定的 Responses 状态报错可能省略 error.code，因此需结合完整资源归属语义判定，
+// 避免与普通 item-not-found、鉴权或其他 400 混淆。
+func isOpenAIResponsesStateRecoveryError(status int, responseBody []byte) bool {
+	if status != http.StatusBadRequest {
+		return false
+	}
+	if extractUpstreamErrorCode(responseBody) == "invalid_encrypted_content" {
+		return true
+	}
+	message := strings.ToLower(extractUpstreamErrorMessage(responseBody))
+	// 中转商可能打码或替换厂商名，要求匹配完整跨资源诊断与处理文案，同时保留 Azure 既有表述。
+	_, resourceDetail, hasResourceMismatch := strings.Cut(message, "the requested item was created under a different ")
+	crossResourceError := hasResourceMismatch && strings.Contains(resourceDetail,
+		" openai resource. use the same resource that created the item to access it.")
+	return strings.Contains(message, "the requested item was created under a different azure openai resource") ||
+		crossResourceError ||
+		(strings.Contains(message, "encrypted content") && strings.Contains(message, "could not be verified"))
+}
+
+// stripOpenAIResponsesInlineState 生成重试请求体，不修改调用方原始字节。
+// 遇到不透明历史引用或 compaction 项时保持原样，不静默删除会话历史。
+func stripOpenAIResponsesInlineState(body []byte) ([]byte, bool, error) {
+	var request map[string]any
+	if err := decodeOpenAIJSONUseNumber(body, &request); err != nil {
+		return nil, false, fmt.Errorf("decode Responses state retry: %w", err)
+	}
+	if hasOpaqueOpenAIResponsesReference(request) {
+		return body, false, nil
+	}
+	items, ok := request["input"].([]any)
+	if !ok || hasOpaqueOpenAIResponsesInputItem(items) {
+		return body, false, nil
+	}
+	filtered, changed := stripInlineStateFromOpenAIResponsesItems(items)
+	if !changed {
+		return body, false, nil
+	}
+	request["input"] = filtered
+	retryBody, err := marshalOpenAIUpstreamJSON(request)
+	return retryBody, true, err
+}
+
+func hasOpaqueOpenAIResponsesReference(request map[string]any) bool {
+	for _, field := range []string{"previous_response_id", "conversation"} {
+		if reference := request[field]; reference != nil && reference != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func hasOpaqueOpenAIResponsesInputItem(items []any) bool {
+	for _, raw := range items {
+		item, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		switch item["type"] {
+		case "item_reference", "compaction", "compaction_summary":
+			return true
+		}
+	}
+	return false
+}
+
+func isInlineOpenAIResponsesInputItem(item map[string]any) bool {
+	switch item["type"] {
+	case "reasoning":
+		cipher, _ := item["encrypted_content"].(string)
+		summary, _ := item["summary"].([]any)
+		return cipher != "" || len(summary) > 0 || item["content"] != nil
+	case "message":
+		return item["content"] != nil
+	case "function_call":
+		return hasInlineOpenAIResponsesToolCall(item, "arguments")
+	case "custom_tool_call":
+		return hasInlineOpenAIResponsesToolCall(item, "input")
+	default:
+		return false
+	}
+}
+
+func hasInlineOpenAIResponsesToolCall(item map[string]any, payloadField string) bool {
+	callID, _ := item["call_id"].(string)
+	name, _ := item["name"].(string)
+	_, hasPayload := item[payloadField].(string)
+	return callID != "" && name != "" && hasPayload
+}
+
+func stripInlineStateFromOpenAIResponsesItems(items []any) ([]any, bool) {
+	changed := false
+	filtered := make([]any, 0, len(items))
+	for _, raw := range items {
+		item, ok := raw.(map[string]any)
+		if !ok {
+			filtered = append(filtered, raw)
+			continue
+		}
+		if isInlineOpenAIResponsesInputItem(item) {
+			if _, exists := item["id"]; exists {
+				delete(item, "id")
+				changed = true
+			}
+			if _, exists := item["encrypted_content"]; exists {
+				delete(item, "encrypted_content")
+				changed = true
+			}
+			if item["type"] == "reasoning" && len(item) == 1 {
+				continue
+			}
+		}
+		filtered = append(filtered, item)
+	}
+	return filtered, changed
+}
+
 func trimOpenAIEncryptedReasoningItems(reqBody map[string]any) bool {
 	if len(reqBody) == 0 {
 		return false

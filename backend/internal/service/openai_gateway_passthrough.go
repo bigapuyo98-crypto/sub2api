@@ -352,6 +352,7 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 
 	agentTaskRecoveryTried := false
 	compactModelFallbackRetried := false
+	httpStateRetryAttempts := 0
 	rejectedFieldRetryState := openAIResponsesRejectedFieldRetryStateForRequest(c, body)
 	var resp *http.Response
 	var usage *OpenAIUsage
@@ -400,6 +401,22 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 				if recoveryErr := s.recoverAgentIdentityTask(ctx, account, expectedTaskID); recoveryErr != nil {
 					return nil, fmt.Errorf("agent identity task recovery failed: %w", recoveryErr)
 				}
+				continue
+			}
+			if account.IsOpenAIApiKey() && !isOpenAIResponsesCompactPath(c) &&
+				httpStateRetryAttempts < maxOpenAIResponsesStateRetries &&
+				isOpenAIResponsesStateRecoveryError(resp.StatusCode, probeBody) {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+				retryBody, changed, retryErr := stripOpenAIResponsesInlineState(body)
+				if retryErr != nil {
+					return nil, retryErr
+				}
+				body = retryBody
+				httpStateRetryAttempts++
+				rejectedFieldRetryState.remember(body)
+				logger.LegacyPrintf("service.openai_gateway", "[OpenAI passthrough] Responses state retry account_id=%d attempt=%d/%d rewritten=%v", account.ID, httpStateRetryAttempts, maxOpenAIResponsesStateRetries, changed)
 				continue
 			}
 			upstreamMsg := sanitizeUpstreamErrorMessage(strings.TrimSpace(extractUpstreamErrorMessage(probeBody)))

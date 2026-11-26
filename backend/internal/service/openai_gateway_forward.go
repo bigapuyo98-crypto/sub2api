@@ -1055,7 +1055,8 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		firstOutputTimeout = s.openAIFirstOutputTimeout(reasoningEffortValue)
 	}
 
-	httpInvalidEncryptedContentRetryTried := false
+	// 仅在检测到显式 API-key 跨资源/密文状态失效时做有界重试，保留 OAuth/compact 的既有 1 次预算。
+	httpStateRetryAttempts := 0
 	compactModelFallbackRetried := false
 	agentTaskRecoveryTried := false
 	rejectedFieldRetryState := openAIResponsesRejectedFieldRetryStateForRequest(c, body)
@@ -1141,29 +1142,51 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 					strings.Contains(upstreamMsg, "The encrypted content") &&
 					strings.Contains(upstreamMsg, "could not be verified") &&
 					strings.Contains(upstreamMsg, "could not be decrypted or parsed"))
-			if !httpInvalidEncryptedContentRetryTried && resp.StatusCode == http.StatusBadRequest && invalidEncryptedContentError {
-				decoded, decodeErr := ensureReqBody()
-				if decodeErr != nil {
-					return nil, decodeErr
-				}
-				invalidDigests := collectOpenAIEncryptedContentDigestsRaw(lineageEntryBody)
-				if trimOpenAIEncryptedReasoningItems(decoded) {
-					body, err = marshalOpenAIUpstreamJSON(decoded)
-					if err != nil {
-						return nil, fmt.Errorf("serialize invalid_encrypted_content retry body: %w", err)
+			apiKeyStateRecovery := account.IsOpenAIApiKey() && !isOpenAIResponsesCompactPath(c) &&
+				isOpenAIResponsesStateRecoveryError(resp.StatusCode, respBody)
+			stateRetryLimit := 1 // 保留旧有 OAuth/compact 的单次恢复预算。
+			if apiKeyStateRecovery {
+				stateRetryLimit = maxOpenAIResponsesStateRetries
+			}
+			if httpStateRetryAttempts < stateRetryLimit && resp.StatusCode == http.StatusBadRequest &&
+				(invalidEncryptedContentError || apiKeyStateRecovery) {
+				changed := false
+				if invalidEncryptedContentError {
+					// 沿用既有精确错误码的脱敏、summary 保留与 lineage 契约。
+					decoded, decodeErr := ensureReqBody()
+					if decodeErr != nil {
+						return nil, decodeErr
 					}
-					if len(invalidDigests) > 0 {
-						if lineageSessionHash == "" {
-							lineageSessionHash = s.GenerateSessionHash(c, lineageEntryBody)
+					if trimOpenAIEncryptedReasoningItems(decoded) {
+						changed = true
+						body, err = marshalOpenAIUpstreamJSON(decoded)
+						if err != nil {
+							return nil, fmt.Errorf("serialize invalid_encrypted_content retry body: %w", err)
 						}
-						s.markOpenAIWSInvalidEncryptedContentLineage(lineageGroupID, lineageSessionHash, invalidDigests)
+						if invalidDigests := collectOpenAIEncryptedContentDigestsRaw(lineageEntryBody); len(invalidDigests) > 0 {
+							if lineageSessionHash == "" {
+								lineageSessionHash = s.GenerateSessionHash(c, lineageEntryBody)
+							}
+							s.markOpenAIWSInvalidEncryptedContentLineage(lineageGroupID, lineageSessionHash, invalidDigests)
+						}
 					}
-					httpInvalidEncryptedContentRetryTried = true
+				} else {
+					body, changed, err = stripOpenAIResponsesInlineState(body)
+					if err != nil {
+						return nil, err
+					}
+				}
+				if changed || apiKeyStateRecovery {
+					if err := ctx.Err(); err != nil {
+						return nil, err
+					}
+					httpStateRetryAttempts++
+					requestView = newOpenAIRequestView(body)
+					reqBody = nil
 					rejectedFieldRetryState.remember(body)
-					logger.LegacyPrintf("service.openai_gateway", "[OpenAI] Retrying non-WSv2 request once after invalid_encrypted_content (account: %s)", account.Name)
+					logger.LegacyPrintf("service.openai_gateway", "[OpenAI] Responses state retry account_id=%d attempt=%d/%d rewritten=%v", account.ID, httpStateRetryAttempts, stateRetryLimit, changed)
 					continue
 				}
-				logger.LegacyPrintf("service.openai_gateway", "[OpenAI] Skip non-WSv2 invalid_encrypted_content retry because encrypted reasoning items are missing (account: %s)", account.Name)
 			}
 			if retryBody, reason, changed, retryErr := normalizeOpenAIResponsesRejectedFieldRetryBody(resp.StatusCode, body, respBody); retryErr != nil {
 				return nil, fmt.Errorf("normalize rejected Responses field retry body: %w", retryErr)
